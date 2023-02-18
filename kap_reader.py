@@ -393,7 +393,7 @@ class reader():
     
     root_url = "http://kap.org.tr/tr"
     headers={'user-agent': 'kap/0.1.1'}
-    proxies={"http":"http://tekprxv2:80", "https":"http://tekprxv2:80"}
+    proxies={}
     notification_initial_id = 1083300 # 2022/12/01
     
     def __init__(self, db_path='kap.db'):
