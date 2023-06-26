@@ -60,15 +60,49 @@
     
 """
 
-import requests
-from bs4 import BeautifulSoup
-import sqlite3
 import os          # drop if database exists
+import sys         # add api key from config file
+import requests    # web scraping
+from bs4 import BeautifulSoup
+import sqlite3     # local database tasks
 import unicodedata # normilize notification explanations
 import time 
+from wrapt_timeout_decorator import timeout # managing timeout hanging from openai
+import argparse    # running with parameters from console
 
-import sys
-import argparse
+
+# summarization api ------------------------------------------
+import openai   
+if not '/data/home/alperayd/Projects/OpenAI/' in sys.path:
+    sys.path.append('/data/home/alperayd/Projects/OpenAI/')
+import CONFIG as cfg
+import imp
+
+# set openai api key with the config file api key
+openai.api_key = cfg.OPENAI_API_KEY
+
+
+API_SUMMARIZATION_PROMPT = """
+    Aşağıdaki dokümanda önemli konular firmaların faaliyet alanları, kişi bilgileri, ad soyad bilgileri, firmadaki görevleri, yatırım bilgileri gibi önemli bilgiler yer almaktadır. Aşağıdaki dokümandaki önemli noktaları vurgulayarak en kısa şekilde Türkçe olarak özetle
+    """
+API_SUMMARIZATION_PROMPT = """
+You are a 10 year experienced banking key account manager working with public companies. You read their public disclosure messages everyday and extract useful information to identify the company's strengths and weaknesses. You are explicitly focused on their activities and investments such as technology or green energy, their growth strategies and investment policies. You are also alert on the names in the documents so that you can track the changes in board members or company representatives. According to this information summarize the following message in Turkish, step by step, as short as possible without omitting any important information.
+"""
+API_ENGINE = "gpt-3.5-turbo"
+API_TEMPERATURE = 0.05
+API_TOP_P = 0.1
+API_MAX_CONTEXT_LENGTH = 4097
+API_TIMEOUT = 15
+# ------------------------------------------------------------
+
+
+# assign proxy as environment variable -----------------------
+proxy = 'http://tekprxv2:80'
+os.environ['http_proxy'] = proxy
+os.environ['HTTP_PROXY'] = proxy
+os.environ['https_proxy'] = proxy
+os.environ['HTTPS_PROXY'] = proxy
+# ------------------------------------------------------------
 
 
 class database():
@@ -107,10 +141,11 @@ class database():
     sql_create_tbl_notifs = """
         create table KAP_NOTIFICATIONS
         (CODE varchar(8), NOTIFICATION_ID INT, PUBLISH_DATE TEXT, DISCLOSURE_TYPE TEXT, YEAR TEXT, PERIOD TEXT,
-         SUMMARY_INFO TEXT, RELATED_COMPANIES, EXPLANATIONS BLOB
+         SUMMARY_INFO TEXT, RELATED_COMPANIES, EXPLANATIONS BLOB,
+         EXPLANATION_SUMMARY BLOB
         )
     """
-    
+        
     def __init__(self, db_path='kap.db'):
         self.db_path = db_path
         pass
@@ -140,22 +175,16 @@ class database():
 
         print('db created')
         
-    def get_conn(self, db_path='kap.db'):
+    def get_conn(self):
         """
             Returnes the connection to the desired sqlite3 database.
+            reads the database path from class attribute (db_path) which can be set at class init.
             
-            Parameters
-            ----------
-                db_path: string=kap.db
-                    Path for the sqlite3 database file
-                
             Returns
             -------
                 connection
                     Sqlite3 connection 
         """
-        
-        self.db_path = db_path
         
         conn = sqlite3.connect(self.db_path)
         return conn
@@ -248,6 +277,8 @@ class database():
     def save_notification(self, notification):
         """
             delete if notification_id exists and save notification to db
+            because of the  latency in summarization explanation_summay may be passed empty string
+            and updated later.
             
             Parameters:
             -----------
@@ -260,7 +291,8 @@ class database():
                     'year': year, 'period':period, 
                     'summary': summary,
                     'related': related,
-                    'explanations':explanations
+                    'explanations':explanations,
+                    'explanation_summary': explanation_summary
                 }                
         """
         try:
@@ -270,9 +302,10 @@ class database():
                                 
             curr.execute("""INSERT INTO KAP_NOTIFICATIONS 
                             (CODE, NOTIFICATION_ID, PUBLISH_DATE, DISCLOSURE_TYPE, YEAR, PERIOD,
-                             SUMMARY_INFO,RELATED_COMPANIES, EXPLANATIONS
+                             SUMMARY_INFO,RELATED_COMPANIES, EXPLANATIONS, 
+                             EXPLANATION_SUMMARY
                             )
-                            VALUES (?,?,?,?,?,?,?,?,?)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)
                          """, list(notification.values()))
             conn.commit()
             curr.close()
@@ -282,6 +315,11 @@ class database():
             return 0, str(ex)
     
     def get_missing_notifications(self):
+        """
+            Generate a list of unused IDs that can be used for new notifications in the kap_notifications table. 
+            Create a sequence of IDs from the minimum to maximum notification_id in the table and then filter out 
+            any IDs that are already present in the table.        
+        """
         sql = """
             WITH RECURSIVE c(x) AS (
              VALUES(1)
@@ -291,8 +329,11 @@ class database():
            select a.CID
            from (
                SELECT x+min_id as CID 
-               FROM c,(select min(notification_id) as min_id, max(notification_id) as max_id from kap_notifications)
-               where x<max_id-min_id
+               FROM c,
+                   (select min(notification_id) as min_id, max(notification_id) as max_id 
+                    from kap_notifications
+                   ) d
+               where x < max_id-min_id
             ) a
             left join (select notification_id from kap_notifications) b on a.CID=b.notification_id
             where b.notification_id is null
@@ -300,6 +341,26 @@ class database():
         ret = self.read_data(sql)
         return ret
         
+    def update_notification(self, notification_id, column_name, value):
+        """
+            updates existing record on db. required for asynchronous summarization task
+        """
+        try:
+            sql = f"""
+                update KAP_NOTIFICATIONS
+                set {column_name}=?
+                where NOTIFICATION_ID=?
+            """
+            conn = self.get_conn()
+            conn.execute(sql, 
+                         (value, notification_id)
+                        )
+            conn.commit()
+            conn.close()
+            return 1, 'ok'
+        
+        except Exception as ex:
+            return 0, str(ex)
     
     # company tasks ----------------------------------------
     def get_company(self, company_id):
@@ -393,7 +454,7 @@ class reader():
     
     root_url = "http://kap.org.tr/tr"
     headers={'user-agent': 'kap/0.1.1'}
-    proxies={}
+    proxies={"http":"http://tekprxv2:80", "https":"http://tekprxv2:80"}
     notification_initial_id = 1083300 # 2022/12/01
     
     def __init__(self, db_path='kap.db'):
@@ -699,8 +760,12 @@ class reader():
         else:
             # if loop competed with the given limit parameter
             # display completed message
-            print('\nlimit parameter reached')            
-            print(f'{notif.get("notification_id")}:{notif.get("publish_date")}')
+            print('')
+            print(f'limit parameter ({limit}) reached')
+            try:
+                print(f'last notif: {notif.get("notification_id")}:{notif.get("publish_date")}')
+            except:
+                print('last notif not found. get_notifications() loop completed without assigning any notification')
     
     def get_missing_notifications(self):
         ret = self.db.get_missing_notifications()[0]
@@ -769,6 +834,94 @@ class reader():
             print(f'https://www.kap.org.tr/{lang}/Bildirim/{r[1]}')
             print('-'*70)        
     
+    @timeout(API_TIMEOUT)
+    def summarize_explanation(self, explanation):
+        """
+            Summarizes an explanation using OpenAI ChatCompletion API.
+            prompt is set by the API_SUMMARIZATION_PROMPT config variable followed by 'explanation' parameter.
+            explanation is limited with the config variable API_MAX_CONTEXT_LENGTH
+
+            Parameters
+            ----------
+            explanation : str
+                The explanation text to be summarized.
+
+            Returns
+            -------
+            explanation_summary : str
+                The summarized explanation text.
+            total_tokens : int
+                The total number of tokens used by the API for summarization.
+        """
+        ret = openai.ChatCompletion.create(
+          model = API_ENGINE,
+          messages=[
+                {"role": "user", "content": API_SUMMARIZATION_PROMPT },
+                {"role": "user", "content": explanation[:API_MAX_CONTEXT_LENGTH] }
+            ],
+            temperature=API_TEMPERATURE,
+            top_p=API_TOP_P
+        )
+        ret
+        explanation_summary = ret['choices'][0]['message']['content']
+        total_tokens = ret['usage']['total_tokens']
+        return explanation_summary, total_tokens
+    
+    def save_notification_summary(self, notification_id):
+        """
+            - read notification from db, 
+            - summarize using api 
+            - update notification record on db
+            
+            timeout decorator prevents hanging for a long time due to openai server delays.
+            
+            Returns
+            -------
+            ret : str
+                return value received from db.update_notification
+                    which is: 1,'ok' or 0, save error
+                if error return None, 0
+        """
+        notification = self.db.get_notification(notification_id)
+        explanation = notification[0]['data'][0][-2]
+        try:
+            explanation_summary, total_tokens = self.summarize_explanation(explanation)
+            ret = self.db.update_notification(notification_id, 'EXPLANATION_SUMMARY', f'{explanation_summary};{total_tokens}')
+        except:
+            ret = None, 0
+            
+        return ret
+    
+    def save_notification_summaries(self, top_n=100):
+        """
+            summarize all missing notifications in db starting from the latest
+        """
+        
+        # read data from db, order by notification id desc, limit top_n
+        sql = f"select * from KAP_NOTIFICATIONS where EXPLANATION_SUMMARY is null order by NOTIFICATION_ID desc LIMIT {top_n}"
+        df = self.db.read_data(sql)
+        
+        # extract notification ids from return data
+        notification_ids = [n[1] for n in df[0]['data']]
+        
+        for i, notification_id in enumerate(notification_ids):
+            ret = self.save_notification_summary(notification_id)
+            # print(notification_id, ret)
+            if ret[0]==1:
+                print('.', end='')
+            else:
+                print('-', end='')
+                
+            if i%10==0 and i>0:
+                print('|', end='')
+                
+            if i%100==0 and i>0:
+                # read token stats
+                ret = self.db.read_data("select * from KAP_NOTIFICATIONS where EXPLANATION_SUMMARY is not null")
+                tokens = [ int(r[-1].split(';')[-1]) for r in ret[0]['data']]
+                print('\t', len(tokens), sum(tokens), sum(tokens)/len(tokens))
+        
+        return 
     
 if __name__ == "__main__":
     cr = reader()
