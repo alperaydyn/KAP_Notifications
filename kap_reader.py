@@ -80,7 +80,7 @@ import imp
 
 # set openai api key with the config file api key
 openai.api_key = cfg.OPENAI_API_KEY
-
+API_KEY_PERSONAL = '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'
 
 API_SUMMARIZATION_PROMPT = """
     Aşağıdaki dokümanda önemli konular firmaların faaliyet alanları, kişi bilgileri, ad soyad bilgileri, firmadaki görevleri, yatırım bilgileri gibi önemli bilgiler yer almaktadır. Aşağıdaki dokümandaki önemli noktaları vurgulayarak en kısa şekilde Türkçe olarak özetle
